@@ -5,12 +5,19 @@
  */
 
 (() => {
-  const WS_URL = 'ws://localhost:8765';
-  let socket = null;
   let isGenerating = false;
   let safeModeActive = true;
-  const reconnectInterval = 2000;
   let lastReportedModel = '';
+
+  function sendToServer(payload) {
+    try {
+      chrome.runtime.sendMessage(payload, () => {
+        if (chrome.runtime.lastError) {
+          // Extension background not ready yet
+        }
+      });
+    } catch {}
+  }
 
   // 1. Platform Detection
   function getPlatform() {
@@ -49,11 +56,12 @@
       },
       findSendButton() {
         return (
-          document.querySelector('button[aria-label*="Send message"]') ||
-          document.querySelector('button[aria-label*="Send"]') ||
+          document.querySelector('button[aria-label*="Send message" i]') ||
+          document.querySelector('button[aria-label*="Send" i]') ||
           document.querySelector('button.send-button') ||
           document.querySelector('button[data-test-id="send-button"]') ||
-          document.querySelector('.send-button-container button')
+          document.querySelector('.send-button-container button') ||
+          document.querySelector('rich-textarea + * button')
         );
       },
       findStopButton() {
@@ -316,23 +324,77 @@
       return true;
     }
 
-    // Rich contenteditable / ProseMirror elements
-    while (input.firstChild) {
-      input.removeChild(input.firstChild);
+    // 1. Select all contents in contenteditable
+    try {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(input);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch {}
+
+    // 2. Try ClipboardEvent / paste (most compatible with ProseMirror/Angular on Gemini)
+    try {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      const pasteEvt = new ClipboardEvent('paste', {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+        composed: true
+      });
+      input.dispatchEvent(pasteEvt);
+    } catch {}
+
+    // 3. Try document.execCommand('insertText') if paste didn't populate
+    if (!input.textContent.trim()) {
+      try {
+        document.execCommand('selectAll', false, null);
+        document.execCommand('insertText', false, text);
+      } catch {}
     }
 
-    const inserted = document.execCommand('insertText', false, text);
-    if (!inserted) {
-      input.innerText = text;
+    // 4. If still empty, try beforeinput InputEvent
+    if (!input.textContent.trim()) {
+      try {
+        const beforeInput = new InputEvent('beforeinput', {
+          inputType: 'insertText',
+          data: text,
+          bubbles: true,
+          cancelable: true,
+          composed: true
+        });
+        input.dispatchEvent(beforeInput);
+      } catch {}
     }
 
+    // 5. Fallback: direct paragraph structure
+    if (!input.textContent.trim()) {
+      const escaped = text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\n/g, '<br>');
+      input.innerHTML = `<p>${escaped}</p>`;
+    }
+
+    // Trigger full input event cascade so UI updates internal state and enables Send button
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: text }));
     input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
     input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-    return true;
+    input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ' ' }));
+
+    return Boolean(input.textContent.trim());
   }
 
-  function submitPrompt() {
-    const sendBtn = currentAdapter.findSendButton();
+  async function submitPrompt() {
+    let sendBtn = currentAdapter.findSendButton();
+    // Allow UI 300ms to enable send button after input event
+    if (!sendBtn || sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true') {
+      await new Promise((r) => setTimeout(r, 300));
+      sendBtn = currentAdapter.findSendButton();
+    }
+
     if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {
       simulateHumanClick(sendBtn);
       return true;
@@ -421,132 +483,150 @@
     });
   }
 
-  // 7. WebSocket Lifecycle
-  function connect() {
-    try {
-      socket = new WebSocket(WS_URL);
-    } catch {
-      setStatus('disconnected');
-      setTimeout(connect, reconnectInterval);
+  // 7. Background Extension Message Bridge (CSP-immune)
+  function handlePrompt(msg) {
+    if (msg.safeMode !== undefined) {
+      safeModeActive = Boolean(msg.safeMode);
+    }
+
+    if (isGenerating) {
+      if (Date.now() - (window._lastPromptTime || 0) > 40000) {
+        console.warn('[Agent Bridge] Auto-recovering from stuck isGenerating state.');
+        isGenerating = false;
+        setStatus('ready');
+      } else {
+        sendToServer({
+          type: 'ERROR',
+          message: `${platform} is currently busy processing another turn.`
+        });
+        return;
+      }
+    }
+
+    window._lastPromptTime = Date.now();
+    isGenerating = true;
+    setStatus('busy');
+
+    const baselineText = currentAdapter.getLatestResponseText();
+    const injected = injectPrompt(msg.text);
+
+    if (!injected) {
+      isGenerating = false;
+      setStatus('ready');
+      sendToServer({
+        type: 'ERROR',
+        message: `Failed to inject prompt into ${platform} input element.`
+      });
       return;
     }
 
-    socket.onopen = () => {
-      const activeModel = currentAdapter.getModelName();
-      lastReportedModel = activeModel;
-      console.log(`[Agent Bridge] Connected to CLI orchestrator on ${platform} (${activeModel}) [Safe Mode: ${safeModeActive}]`);
-      setStatus('ready');
+    const delayMs = safeModeActive
+      ? Math.floor(1200 + Math.random() * 1200)
+      : 300;
 
-      socket.send(
-        JSON.stringify({
+    setTimeout(async () => {
+      try {
+        await submitPrompt();
+        const resultText = await monitorResponse(baselineText);
+        sendToServer({
+          type: 'RESPONSE',
+          text: resultText,
+          model: currentAdapter.getModelName()
+        });
+      } catch (err) {
+        sendToServer({
+          type: 'ERROR',
+          message: `Execution failed: ${err.message}`
+        });
+      } finally {
+        isGenerating = false;
+        setStatus('ready');
+      }
+    }, delayMs);
+  }
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'WS_STATUS') {
+      if (msg.connected) {
+        if (msg.safeMode !== undefined) safeModeActive = Boolean(msg.safeMode);
+        const activeModel = currentAdapter.getModelName();
+        lastReportedModel = activeModel;
+        setStatus(isGenerating ? 'busy' : 'ready');
+        sendToServer({
           type: 'HELLO',
           platform,
           model: activeModel,
           safeMode: safeModeActive,
           url: window.location.href
-        })
-      );
-    };
+        });
+      } else {
+        setStatus('disconnected');
+      }
+      return;
+    }
 
-    socket.onclose = () => {
-      console.log('[Agent Bridge] Disconnected from CLI orchestrator, retrying...');
-      setStatus('disconnected');
-      socket = null;
-      setTimeout(connect, reconnectInterval);
-    };
+    if (msg.type === 'CONFIG') {
+      if (msg.safeMode !== undefined) {
+        safeModeActive = Boolean(msg.safeMode);
+      }
+      setStatus(isGenerating ? 'busy' : 'ready');
+      return;
+    }
 
-    socket.onerror = () => {
-      setStatus('disconnected');
-    };
+    if (msg.type === 'PROMPT') {
+      handlePrompt(msg);
+      return;
+    }
+  });
 
-    socket.onmessage = async (event) => {
-      try {
-        const msg = JSON.parse(event.data);
+  let isCurrentlyConnected = false;
 
-        if (msg.type === 'CONFIG') {
-          if (msg.safeMode !== undefined) {
-            safeModeActive = Boolean(msg.safeMode);
+  function syncStatusWithBackground() {
+    try {
+      chrome.runtime.sendMessage({ type: 'GET_WS_STATUS' }, (res) => {
+        if (chrome.runtime.lastError || !res) {
+          if (isCurrentlyConnected) {
+            isCurrentlyConnected = false;
+            setStatus('disconnected');
           }
-          setStatus(isGenerating ? 'busy' : 'ready');
           return;
         }
 
-        if (msg.type === 'PROMPT') {
-          if (msg.safeMode !== undefined) {
-            safeModeActive = Boolean(msg.safeMode);
+        if (res.safeMode !== undefined) safeModeActive = Boolean(res.safeMode);
+
+        if (res.connected) {
+          const currentModel = currentAdapter.getModelName();
+          if (!isCurrentlyConnected) {
+            isCurrentlyConnected = true;
+            lastReportedModel = currentModel;
+            setStatus(isGenerating ? 'busy' : 'ready');
+            sendToServer({
+              type: 'HELLO',
+              platform,
+              model: currentModel,
+              safeMode: safeModeActive,
+              url: window.location.href
+            });
+          } else if (currentModel !== lastReportedModel) {
+            lastReportedModel = currentModel;
+            setStatus(isGenerating ? 'busy' : 'ready');
+            sendToServer({
+              type: 'STATUS',
+              platform,
+              model: currentModel,
+              safeMode: safeModeActive
+            });
           }
-
-          if (isGenerating) {
-            socket.send(
-              JSON.stringify({
-                type: 'ERROR',
-                message: `${platform} is currently busy processing another turn.`
-              })
-            );
-            return;
+        } else {
+          if (isCurrentlyConnected) {
+            isCurrentlyConnected = false;
+            setStatus('disconnected');
           }
-
-          isGenerating = true;
-          setStatus('busy');
-
-          const baselineText = currentAdapter.getLatestResponseText();
-          const injected = injectPrompt(msg.text);
-
-          if (!injected) {
-            isGenerating = false;
-            setStatus('ready');
-            socket.send(
-              JSON.stringify({
-                type: 'ERROR',
-                message: `Failed to inject prompt into ${platform} input element.`
-              })
-            );
-            return;
-          }
-
-          // Humanized jitter delay: between 1200ms and 2400ms in safe mode (never 0ms)
-          const delayMs = safeModeActive
-            ? Math.floor(1200 + Math.random() * 1200)
-            : 300;
-
-          setTimeout(async () => {
-            submitPrompt();
-            const resultText = await monitorResponse(baselineText);
-            isGenerating = false;
-            setStatus('ready');
-
-            socket.send(
-              JSON.stringify({
-                type: 'RESPONSE',
-                text: resultText
-              })
-            );
-          }, delayMs);
         }
-      } catch (err) {
-        console.error('[Agent Bridge] Message processing error:', err);
-      }
-    };
+      });
+    } catch {}
   }
 
-  // Periodic model check to notify CLI if model changes dynamically
-  setInterval(() => {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      const currentModel = currentAdapter.getModelName();
-      if (currentModel !== lastReportedModel) {
-        lastReportedModel = currentModel;
-        setStatus('ready');
-        socket.send(
-          JSON.stringify({
-            type: 'STATUS',
-            platform,
-            model: currentModel,
-            safeMode: safeModeActive
-          })
-        );
-      }
-    }
-  }, 3000);
-
-  connect();
+  syncStatusWithBackground();
+  setInterval(syncStatusWithBackground, 2500);
 })();

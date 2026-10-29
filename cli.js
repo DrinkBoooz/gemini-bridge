@@ -456,16 +456,28 @@ function start() {
       }
     });
 
+    ws.on('error', (err) => {
+      console.log(`\x1b[33m[Socket Notice]\x1b[0m Connection dropped: ${err.message}`);
+    });
+
     ws.on('close', () => {
       console.log('\n\x1b[31m[Bridge Disconnected]\x1b[0m Browser extension detached.');
       activeSocket = null;
     });
   });
 
-  server.listen(WS_PORT, () => {
+  wss.on('error', (err) => {
+    console.error(`\x1b[31m[WebSocket Server Error]\x1b[0m`, err.message);
+  });
+
+  server.on('error', (err) => {
+    console.error(`\x1b[31m[HTTP Server Error]\x1b[0m`, err.message);
+  });
+
+  server.listen(WS_PORT, '0.0.0.0', () => {
     console.log(`\x1b[35m=== Gemini Bridge Orchestrator & Universal Proxy ===\x1b[0m`);
     console.log(`HTTP/OpenAI API: http://localhost:${WS_PORT}/v1`);
-    console.log(`WebSocket Bridge: ws://localhost:${WS_PORT}`);
+    console.log(`WebSocket Bridge: ws://127.0.0.1:${WS_PORT}`);
     console.log(`Safety Mode:     ${isSafeMode ? '\x1b[32mEnabled (1500ms pacing + humanized jitter)\x1b[0m' : '\x1b[33mDisabled (--fast active)\x1b[0m'}`);
     console.log(`Waiting for browser connection (Gemini / ChatGPT / Claude)...`);
   });
